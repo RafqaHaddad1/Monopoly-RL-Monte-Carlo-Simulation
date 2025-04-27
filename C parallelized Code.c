@@ -1,4 +1,4 @@
-
+%%writefile monopoly.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -639,6 +639,7 @@ StepResult step_monopoly_env(MonopolyEnv* env, int action, int* obs) {
             bool can_afford = (env->money[p] >= prop_price);
             if (can_afford) {
                 if (action == 1) { // Agent chose to buy
+                    current_step_reward += 100.0; // bonus reward for buying a property
                     env->money[p] -= prop_price;
                     env->properties[pos].owner = p;
                     env->properties[pos].houses = 0; // Ensure houses reset on purchase
