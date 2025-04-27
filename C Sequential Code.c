@@ -1,4 +1,4 @@
-
+%%writefile monopoly.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -653,31 +653,104 @@ StepResult step_monopoly_env(MonopolyEnv* env, int action, int* obs) {
                          "Player %d cannot afford property %d (%s) ($%d). ", p, pos, current_property->name, prop_price);
             }
         }
-        // b) Owned by opponent
-        else if (prop_owner != p) {
-            int rent_due = prop_rent; // Base rent
-            // Basic house multiplier
-            if (prop_houses > 0) {
-                 rent_due *= (prop_houses + 1); // Simple multiplier
-            }
+       // b) Owned by opponent
+      else if (prop_owner != p) {
+          int rent_due = prop_rent; // Base rent
+          
+          // More realistic rent multipliers based on house count
+          if (prop_houses > 0) {
+              switch (prop_houses) {
+                  case 1:
+                      rent_due = prop_rent * 5;    // Typically 5x base rent
+                      break;
+                  case 2:
+                      rent_due = prop_rent * 15;   // Typically 15x base rent
+                      break;
+                  case 3:
+                      rent_due = prop_rent * 45;   // Typically 45x base rent
+                      break;
+                  case 4:
+                      rent_due = prop_rent * 80;   // Typically 80x base rent
+                      break;
+                  case 5: // Hotel
+                      rent_due = prop_rent * 125;  // Typically 125x base rent
+                      break;
+                  default:
+                      rent_due *= (prop_houses + 1); // Fallback
+              }
+          }
 
-            int payment = (env->money[p] < rent_due) ? env->money[p] : rent_due; // Pay what you can
+          int payment = (env->money[p] < rent_due) ? env->money[p] : rent_due; // Pay what you can
 
-            env->money[p] -= payment;
-            if (prop_owner >= 0 && prop_owner < env->num_players) { // Ensure owner is valid
-                env->money[prop_owner] += payment;
-            }
-            fee_paid_this_turn += payment; // Rent counts as a fee paid
-            card_reward_contribution -= payment; // Negative reward for paying rent
+          env->money[p] -= payment;
+          if (prop_owner >= 0 && prop_owner < env->num_players) { // Ensure owner is valid
+              env->money[prop_owner] += payment;
+          }
+          fee_paid_this_turn += payment; // Rent counts as a fee paid
+          card_reward_contribution -= payment; // Negative reward for paying rent
 
-            snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
-                     "Paid $%d rent to Player %d at property %d (%s) with %d houses. ",
-                     payment, prop_owner, pos, current_property->name, prop_houses);
-        }
+          // Update log message
+          const char* property_state = (prop_houses == 5) ? "hotel" : 
+                                    (prop_houses > 0) ? "houses" : "no houses";
+          
+          snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                  "Paid $%d rent to Player %d at property %d (%s) with %d %s. ",
+                  payment, prop_owner, pos, current_property->name, 
+                  (prop_houses == 5) ? 1 : prop_houses, property_state);
+      }
         // c) Owned by self
         else {
-             snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
-                     "Landed on own property %d (%s). ", pos, current_property->name);
+            // Check if player can buy houses on this property
+            bool can_buy_houses = (env->properties[pos].house_cost > 0 && env->money[p] >= env->properties[pos].house_cost);
+            int current_houses = env->properties[pos].houses;
+            int max_houses = 5; // 4 houses + 1 hotel
+            
+            // Only allow buying houses if we have less than the maximum
+            if (can_buy_houses && current_houses < max_houses) {
+                // Determine how many houses the player can afford
+                int affordable_houses = env->money[p] / env->properties[pos].house_cost;
+                // Limit to how many more houses can be added
+                int max_new_houses = max_houses - current_houses;
+                int houses_can_buy = (affordable_houses < max_new_houses) ? affordable_houses : max_new_houses;
+                
+                // Agent decides whether to buy houses and how many (using action)
+                // For simplicity, if action is 1 (buy), buy as many as possible up to 1
+                int houses_to_buy = 0;
+                if (action == 1 && houses_can_buy > 0) {
+                    houses_to_buy = 1; // Buy one house at a time
+                    
+                    // Update property and player money
+                    int house_cost = env->properties[pos].house_cost;
+                    env->properties[pos].houses += houses_to_buy;
+                    env->money[p] -= house_cost * houses_to_buy;
+                    
+                    // Log the purchase
+                    snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                            "Landed on own property %d (%s). Bought %d house(s) for $%d. Now has %d houses. ", 
+                            pos, current_property->name, houses_to_buy, house_cost * houses_to_buy, 
+                            env->properties[pos].houses);
+                } else {
+                    // Chose not to buy houses
+                    snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                            "Landed on own property %d (%s). Chose not to buy houses (current: %d). ", 
+                            pos, current_property->name, current_houses);
+                }
+            } else if (current_houses >= max_houses) {
+                // Already has maximum houses
+                snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                        "Landed on own property %d (%s). Already has maximum houses/hotel (%d). ", 
+                        pos, current_property->name, current_houses);
+            } else if (env->properties[pos].house_cost <= 0) {
+                // Property doesn't support houses (like railroads or utilities)
+                snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                        "Landed on own property %d (%s). This property type doesn't support houses. ", 
+                        pos, current_property->name);
+            } else {
+                // Can't afford houses
+                snprintf(log_buffer + strlen(log_buffer), sizeof(log_buffer) - strlen(log_buffer),
+                        "Landed on own property %d (%s). Cannot afford houses (cost: $%d). ", 
+                        pos, current_property->name, env->properties[pos].house_cost);
+            }
         }
     }
      // 4. Other non-action squares
