@@ -1,4 +1,4 @@
-%%writefile monopoly.c
+%%writefile monopolycuda.cu
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -7,6 +7,8 @@
 #include <limits.h>
 #include <errno.h>
 #include <math.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
 
 // --- Constants ---
 #define BOARD_SIZE 40
@@ -19,6 +21,10 @@
 #define VISITED_SET_INITIAL_SIZE 256
 #define MAX_EPISODE_STEPS 500
 #define LOG_BUFFER_SIZE 1000
+
+// CUDA-specific constants
+#define THREADS_PER_BLOCK 256
+#define MAX_BLOCKS 64
 
 // --- Structures ---
 
@@ -116,6 +122,96 @@ typedef struct {
     // Observation array is filled by the caller's provided pointer
 } StepResult;
 
+// Represents the simplified state used as a key in the Q-table
+typedef struct {
+    int position;
+    int money_bin; // Discretized money
+    int current_prop_owner; // Owner of the property player is on (-1, 0, 1, ...)
+    int in_jail; // 0 or 1
+} StateTuple;
+
+// Data stored for each ACTION within a state entry in the Q-table
+typedef struct {
+    double sum_returns;
+    int count;
+    double q_value; // q_value = sum_returns / count
+} QValueData;
+
+// An entry in the Q-value hash table (using chaining for collisions)
+typedef struct QTableEntry {
+    StateTuple key;
+    QValueData values[2]; // Index 0 for action 0 (Pass), 1 for action 1 (Buy)
+    struct QTableEntry* next; // Pointer for chaining
+} QTableEntry;
+
+// The Q-value hash table structure
+typedef struct {
+    QTableEntry** table;
+    int size;
+    int count; // Number of entries
+} QHashTable;
+
+// Represents a (StateTuple, action) pair for the visited set during update
+typedef struct {
+    StateTuple state;
+    int action;
+} VisitedKey;
+
+// An entry in the visited set hash table (using chaining)
+typedef struct VisitedSetEntry {
+    VisitedKey key;
+    struct VisitedSetEntry* next;
+} VisitedSetEntry;
+
+// The visited set hash table structure
+typedef struct {
+    VisitedSetEntry** table;
+    int size;
+    int count;
+} VisitedSet;
+
+// Structure to hold one step of an episode's history
+typedef struct {
+    StateTuple state; // The state tuple *before* taking the action
+    int action;
+    double reward;
+} EpisodeStep;
+
+// Structure to hold the history of an entire episode
+typedef struct {
+    EpisodeStep* steps;
+    int count;
+    int capacity;
+} EpisodeHistory;
+
+// The Monte Carlo Agent structure
+typedef struct {
+    double epsilon;
+    int num_players;
+    QHashTable* q_table; // Pointer to the Q-value hash table
+} MonteCarloAgent;
+
+// CUDA-specific structures for parallel episode generation
+typedef struct {
+    int positions[MAX_PLAYERS];
+    int money[MAX_PLAYERS];
+    int in_jail[MAX_PLAYERS];
+    int jail_counters[MAX_PLAYERS];
+    int property_owners[MAX_PROPERTIES];
+    int property_houses[MAX_PROPERTIES];
+    int current_player;
+    int steps_taken;
+    bool done;
+    curandState rand_state;
+} CUDAEnvState;
+
+typedef struct {
+    EpisodeStep steps[MAX_EPISODE_STEPS];
+    int count;
+    LogEntry logs[MAX_EPISODE_STEPS];
+    int log_count;
+    int episode_id;
+} CUDAEpisodeData;
 
 // --- Helper Functions ---
 
@@ -182,7 +278,6 @@ static CardEffectResult go_to_jail(MonopolyEnv* env, int player) {
     return result;
 }
 
-
 // --- Card Effect Implementations ---
 static CardEffectResult card_advance_to_go(MonopolyEnv* env, int player) {
     return advance_to_go(env, player);
@@ -207,7 +302,6 @@ static CardEffectResult card_doctors_fee(MonopolyEnv* env, int player) {
 static CardEffectResult card_tax_refund(MonopolyEnv* env, int player) {
     return adjust_money(env, player, 20);
 }
-
 
 // --- Core Environment Functions ---
 
@@ -311,7 +405,6 @@ static int get_observation_size(int num_players) {
     return num_players + num_players + num_players + BOARD_SIZE + 1;
 }
 
-
 // Create and initialize the environment
 MonopolyEnv* create_monopoly_env(int num_players, int start_money, int go_reward) {
     if (num_players <= 0 || num_players > MAX_PLAYERS) {
@@ -398,7 +491,6 @@ void reset_monopoly_env(MonopolyEnv* env, int* obs) {
     get_observation(env, obs);
 }
 
-
 // Advance to the next player
 static void next_player(MonopolyEnv* env) {
     env->current_player = (env->current_player + 1) % env->num_players;
@@ -448,7 +540,6 @@ static LogEntry create_log_entry(MonopolyEnv* env, int player, int pos_before, i
 
     return entry;
 }
-
 
 // Perform one step in the environment
 // Action: 0=Pass/Don't Buy, 1=Buy
@@ -639,7 +730,6 @@ StepResult step_monopoly_env(MonopolyEnv* env, int action, int* obs) {
             bool can_afford = (env->money[p] >= prop_price);
             if (can_afford) {
                 if (action == 1) { // Agent chose to buy
-                    current_step_reward += 100.0; // bonus reward for buying a property
                     env->money[p] -= prop_price;
                     env->properties[pos].owner = p;
                     env->properties[pos].houses = 0; // Ensure houses reset on purchase
@@ -877,7 +967,6 @@ StepResult step_monopoly_env(MonopolyEnv* env, int action, int* obs) {
     return result;
 }
 
-
 // Render the current state to the console
 void render_monopoly_env(MonopolyEnv* env) {
     if (!env) return;
@@ -911,81 +1000,6 @@ void render_monopoly_env(MonopolyEnv* env) {
        printf("----------------------------------------\n");
     }
 }
-
-
-// --- Agent Data Structures ---
-
-// Represents the simplified state used as a key in the Q-table
-typedef struct {
-    int position;
-    int money_bin; // Discretized money
-    int current_prop_owner; // Owner of the property player is on (-1, 0, 1, ...)
-    int in_jail; // 0 or 1
-} StateTuple;
-
-// Data stored for each ACTION within a state entry in the Q-table
-typedef struct {
-    double sum_returns;
-    int count;
-    double q_value; // q_value = sum_returns / count
-} QValueData;
-
-// An entry in the Q-value hash table (using chaining for collisions)
-typedef struct QTableEntry {
-    StateTuple key;
-    QValueData values[2]; // Index 0 for action 0 (Pass), 1 for action 1 (Buy)
-    struct QTableEntry* next; // Pointer for chaining
-} QTableEntry;
-
-// The Q-value hash table structure
-typedef struct {
-    QTableEntry** table;
-    int size;
-    int count; // Number of entries
-} QHashTable;
-
-// Represents a (StateTuple, action) pair for the visited set during update
-typedef struct {
-    StateTuple state;
-    int action;
-} VisitedKey;
-
-// An entry in the visited set hash table (using chaining)
-typedef struct VisitedSetEntry {
-    VisitedKey key;
-    struct VisitedSetEntry* next;
-} VisitedSetEntry;
-
-// The visited set hash table structure
-typedef struct {
-    VisitedSetEntry** table;
-    int size;
-    int count;
-} VisitedSet;
-
-
-// Structure to hold one step of an episode's history
-typedef struct {
-    StateTuple state; // The state tuple *before* taking the action
-    int action;
-    double reward;
-} EpisodeStep;
-
-// Structure to hold the history of an entire episode
-typedef struct {
-    EpisodeStep* steps;
-    int count;
-    int capacity;
-} EpisodeHistory;
-
-
-// The Monte Carlo Agent structure
-typedef struct {
-    double epsilon;
-    int num_players;
-    QHashTable* q_table; // Pointer to the Q-value hash table
-} MonteCarloAgent;
-
 
 // --- Hash Table & State Tuple Helper Functions ---
 
@@ -1050,7 +1064,6 @@ static QTableEntry* find_or_create_q_entry(QHashTable* ht, StateTuple key) {
     return new_entry;
 }
 
-
 // Destroy the Q-value hash table
 static void destroy_q_hash_table(QHashTable* ht) {
     if (!ht) return;
@@ -1065,7 +1078,6 @@ static void destroy_q_hash_table(QHashTable* ht) {
     free(ht->table);
     free(ht);
 }
-
 
 // --- Visited Set Hash Table Functions ---
 
@@ -1135,7 +1147,6 @@ static void destroy_visited_set(VisitedSet* vs) {
     free(vs->table);
     free(vs);
 }
-
 
 // --- Episode History Functions ---
 
@@ -1224,7 +1235,6 @@ static StateTuple _get_state_tuple_c(const int* obs, int num_players, int board_
 
     return current_state_tuple;
 }
-
 
 // Select action using epsilon-greedy policy based on Q-values
 int select_action_mc(MonteCarloAgent* agent, StateTuple state_tuple, MonopolyEnv* env) {
@@ -1325,14 +1335,10 @@ EpisodeHistory generate_episode_mc(MonteCarloAgent* agent, MonopolyEnv* env, int
     if (out_logs && out_log_count) {
         *out_logs = log_buffer; // Point to the static buffer
         *out_log_count = log_count;
-    } else if (out_logs) {
-        *out_logs = NULL;
-        *out_log_count = 0;
     }
 
     return history; // Remember to call free_episode_history on this later
 }
-
 
 // Update Q-values using First-Visit Monte Carlo based on an episode history
 void update_mc(MonteCarloAgent* agent, EpisodeHistory* history) {
@@ -1377,6 +1383,324 @@ void update_mc(MonteCarloAgent* agent, EpisodeHistory* history) {
     // Clean up the temporary visited set for this episode
     destroy_visited_set(visited_state_actions);
 }
+
+// --- CUDA Kernel Functions ---
+
+// CUDA device function to get a random number
+__device__ int cuda_rand(curandState* state) {
+    return curand(state) % RAND_MAX;
+}
+
+// CUDA device function to get a random float between 0 and 1
+__device__ float cuda_rand_float(curandState* state) {
+    return curand_uniform(state);
+}
+
+// CUDA device function to check if a position requires paying a fee
+__device__ int cuda_get_fee_for_position(int position) {
+    switch (position) {
+        case 4: return 200; // Income tax
+        case 38: return 100; // Luxury tax
+        default: return 0;
+    }
+}
+
+// CUDA device function to check if a position is Chance
+__device__ bool cuda_is_chance_position(int position) {
+    return position == 7 || position == 22 || position == 36;
+}
+
+// CUDA device function to check if a position is Community Chest
+__device__ bool cuda_is_chest_position(int position) {
+    return position == 2 || position == 17 || position == 33;
+}
+
+// CUDA device function to extract state tuple from observation
+__device__ StateTuple cuda_get_state_tuple(const int* obs, int num_players, int board_size) {
+    StateTuple current_state_tuple = {0};
+    int current_player_idx = obs[num_players * 3 + board_size]; // Last element is current player index
+
+    // Extract relevant parts for the *current* player
+    int player_pos = obs[current_player_idx];
+    int player_money = obs[num_players + current_player_idx];
+    int player_in_jail = obs[2 * num_players + current_player_idx];
+
+    // Find owner of the property the current player landed on
+    int owners_start_idx = 3 * num_players;
+    int current_prop_owner = -1; // Default if not on a property square or index out of bounds
+    if (player_pos >= 0 && player_pos < board_size) {
+         current_prop_owner = obs[owners_start_idx + player_pos];
+    }
+
+    current_state_tuple.position = player_pos;
+    current_state_tuple.money_bin = player_money / 100; // Bin money by 100
+    current_state_tuple.current_prop_owner = current_prop_owner;
+    current_state_tuple.in_jail = player_in_jail;
+
+    return current_state_tuple;
+}
+
+// CUDA kernel to initialize random states
+__global__ void init_rand_states(curandState* states, unsigned long seed) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    curand_init(seed, idx, 0, &states[idx]);
+}
+
+// CUDA device string handling functions
+__device__ void d_strcpy(char* dest, const char* src, int max_len) {
+    int i;
+    for (i = 0; i < max_len - 1 && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+}
+
+__device__ void d_strcat(char* dest, const char* src, int max_len) {
+    int dest_len = 0;
+    while (dest_len < max_len && dest[dest_len] != '\0') {
+        dest_len++;
+    }
+    
+    int i;
+    for (i = 0; i < max_len - dest_len - 1 && src[i] != '\0'; i++) {
+        dest[dest_len + i] = src[i];
+    }
+    dest[dest_len + i] = '\0';
+}
+
+__device__ int d_strlen(const char* str, int max_len) {
+    int len = 0;
+    while (len < max_len && str[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
+__device__ void d_sprintf_int(char* dest, int value, int max_len) {
+    if (max_len <= 1) {
+        if (max_len == 1) dest[0] = '\0';
+        return;
+    }
+
+    // Handle negative numbers
+    bool is_negative = value < 0;
+    if (is_negative) {
+        value = -value;
+    }
+
+    // Convert number to string (reversed)
+    char temp[12]; // Enough for 32-bit int
+    int idx = 0;
+    do {
+        temp[idx++] = '0' + (value % 10);
+        value /= 10;
+    } while (value > 0 && idx < 11);
+
+    // Add negative sign if needed
+    if (is_negative && idx < 11) {
+        temp[idx++] = '-';
+    }
+
+    // Reverse the string into destination
+    int dest_idx = 0;
+    while (idx > 0 && dest_idx < max_len - 1) {
+        dest[dest_idx++] = temp[--idx];
+    }
+    dest[dest_idx] = '\0';
+}
+
+// Modify the kernel to use device string functions
+__global__ void simulate_episodes_kernel(
+    curandState* rand_states,
+    int num_players,
+    int start_money,
+    int go_reward,
+    int board_size,
+    int jail_position,
+    int go_to_jail_position,
+    int jail_turns,
+    int* property_prices,
+    int* property_rents,
+    int* property_house_costs,
+    double epsilon,
+    CUDAEpisodeData* episode_data,
+    int episode_offset
+) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    curandState local_state = rand_states[tid];
+    
+    // Initialize environment state
+    CUDAEnvState env_state;
+    memset(&env_state, 0, sizeof(CUDAEnvState));
+    env_state.rand_state = local_state;
+    
+    // Initialize player state
+    for (int i = 0; i < num_players; i++) {
+        env_state.positions[i] = 0;
+        env_state.money[i] = start_money;
+        env_state.in_jail[i] = false;
+        env_state.jail_counters[i] = 0;
+    }
+    
+    // Initialize property state
+    for (int i = 0; i < board_size; i++) {
+        env_state.property_owners[i] = -1;
+        env_state.property_houses[i] = 0;
+    }
+    
+    env_state.current_player = 0;
+    env_state.steps_taken = 0;
+    env_state.done = false;
+    
+    // Initialize episode data
+    CUDAEpisodeData* episode = &episode_data[tid];
+    episode->count = 0;
+    episode->log_count = 0;
+    episode->episode_id = tid + episode_offset;
+    
+    // Clear log buffer
+    memset(episode->logs, 0, sizeof(LogEntry) * MAX_EPISODE_STEPS);
+    
+    // Simulate episode
+    int step_count = 0;
+    char temp[MAX_DESC_LEN]; // Declare temp buffer at the start of the kernel
+    
+    while (!env_state.done && step_count < MAX_EPISODE_STEPS) {
+        // Get current player
+        int p = env_state.current_player;
+        int prev_money = env_state.money[p];
+        int prev_position = env_state.positions[p];
+        
+        // Roll dice
+        int dice1 = (cuda_rand(&env_state.rand_state) % 6) + 1;
+        int dice2 = (cuda_rand(&env_state.rand_state) % 6) + 1;
+        int dice_total = dice1 + dice2;
+        
+        // Move player
+        int new_position = (prev_position + dice_total) % board_size;
+        int landed_position = new_position;
+        
+        // Check for passing GO
+        if (new_position < prev_position && !env_state.in_jail[p]) {
+            env_state.money[p] += go_reward;
+        }
+        
+        // Update position
+        env_state.positions[p] = new_position;
+        
+        // Handle property landing
+        int prop_owner = env_state.property_owners[new_position];
+        int prop_price = property_prices[new_position];
+        int prop_rent = property_rents[new_position];
+        
+        // Initialize log entry
+        LogEntry* log = &episode->logs[episode->log_count];
+        memset(log, 0, sizeof(LogEntry));
+        
+        log->episode_id = episode->episode_id;
+        log->step = step_count;
+        log->player = p;
+        log->position_before = prev_position;
+        log->dice_roll = dice_total;
+        log->landed_on_position = landed_position;
+        log->position_after = new_position;
+        log->money_before = prev_money;
+        log->in_jail = env_state.in_jail[p];
+        
+        // Decide action and handle property
+        int action = 0;
+        double reward = 0.0;
+        
+        if (prop_price > 0 && prop_owner == -1 && env_state.money[p] >= prop_price) {
+            // Epsilon-greedy action selection
+            if (cuda_rand_float(&env_state.rand_state) < epsilon) {
+                action = cuda_rand(&env_state.rand_state) % 2;
+            } else {
+                action = 1; // Default to buy for demonstration
+            }
+            
+            // Execute action
+            if (action == 1) {
+                env_state.money[p] -= prop_price;
+                env_state.property_owners[new_position] = p;
+                d_sprintf_int(temp, new_position, MAX_DESC_LEN);
+                d_strcpy(log->action_desc, "Bought property at position ", MAX_DESC_LEN);
+                d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+                d_strcat(log->action_desc, " for $", MAX_DESC_LEN);
+                d_sprintf_int(temp, prop_price, MAX_DESC_LEN);
+                d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+            } else {
+                d_sprintf_int(temp, new_position, MAX_DESC_LEN);
+                d_strcpy(log->action_desc, "Passed on buying property at position ", MAX_DESC_LEN);
+                d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+            }
+        } else if (prop_owner != -1 && prop_owner != p) {
+            // Pay rent
+            int rent_due = prop_rent;
+            env_state.money[p] -= rent_due;
+            d_strcpy(log->action_desc, "Paid $", MAX_DESC_LEN);
+            d_sprintf_int(temp, rent_due, MAX_DESC_LEN);
+            d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+            d_strcat(log->action_desc, " rent at position ", MAX_DESC_LEN);
+            d_sprintf_int(temp, new_position, MAX_DESC_LEN);
+            d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+            d_strcat(log->action_desc, " to player ", MAX_DESC_LEN);
+            d_sprintf_int(temp, prop_owner, MAX_DESC_LEN);
+            d_strcat(log->action_desc, temp, MAX_DESC_LEN);
+            log->fee_paid = rent_due;
+        }
+        
+        // Calculate reward as change in money
+        reward = (double)(env_state.money[p] - prev_money);
+        
+        // Check for bankruptcy
+        if (env_state.money[p] < 0) {
+            env_state.done = true;
+            reward -= 1000.0; // Bankruptcy penalty
+            d_strcat(log->action_desc, " (BANKRUPT)", MAX_DESC_LEN);
+        }
+        
+        // Complete log entry
+        log->money_after = env_state.money[p];
+        log->reward = reward;
+        log->done = env_state.done;
+        log->agent_action = action;
+        
+        // Count owned properties
+        log->num_owned_properties = 0;
+        for (int i = 0; i < board_size; i++) {
+            if (env_state.property_owners[i] == p) {
+                log->num_owned_properties++;
+            }
+        }
+        
+        // Clear card-related fields (since we're not handling cards in the simplified CUDA version)
+        log->card_drawn[0] = '\0';
+        log->card_specific_desc[0] = '\0';
+        
+        // Increment log count
+        episode->log_count++;
+        
+        // Record step in episode history
+        if (episode->count < MAX_EPISODE_STEPS) {
+            StateTuple state = {prev_position, prev_money/100, prop_owner, env_state.in_jail[p]};
+            episode->steps[episode->count].state = state;
+            episode->steps[episode->count].action = action;
+            episode->steps[episode->count].reward = reward;
+            episode->count++;
+        }
+        
+        // Next player
+        env_state.current_player = (env_state.current_player + 1) % num_players;
+        env_state.steps_taken++;
+        step_count++;
+    }
+    
+    // Save updated random state
+    rand_states[tid] = env_state.rand_state;
+}
+
+// Function to escape CSV strings
 static char* escape_csv_string(const char* input) {
     if (!input) return NULL;
 
@@ -1408,10 +1732,12 @@ static char* escape_csv_string(const char* input) {
     return output;
 }
 
-
 // Writes a single LogEntry to the CSV file
 static void write_log_to_csv(FILE* fp, const LogEntry* log) {
-    if (!fp || !log) return;
+    if (!fp || !log) {
+        fprintf(stderr, "Error: Invalid file pointer or log entry\n");
+        return;
+    }
 
     // Escape potentially problematic string fields
     char* escaped_action_desc = escape_csv_string(log->action_desc);
@@ -1419,11 +1745,12 @@ static void write_log_to_csv(FILE* fp, const LogEntry* log) {
     char* escaped_card_spec_desc = escape_csv_string(log->card_specific_desc);
 
     // Handle potential allocation failures during escaping
-    if (!escaped_action_desc) escaped_action_desc = strdup("\"\""); // Use empty quoted string if allocation fails
+    if (!escaped_action_desc) escaped_action_desc = strdup("\"\"");
     if (!escaped_card_name) escaped_card_name = strdup("\"\"");
     if (!escaped_card_spec_desc) escaped_card_spec_desc = strdup("\"\"");
 
-    fprintf(fp, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%d,%s,%s,%s\n",
+    // Write the log entry with error checking
+    int write_result = fprintf(fp, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%d,%d,%d,%d,%s,%s,%s\n",
             log->episode_id,
             log->step,
             log->player,
@@ -1434,20 +1761,49 @@ static void write_log_to_csv(FILE* fp, const LogEntry* log) {
             log->money_before,
             log->money_after,
             log->reward,
-            (int)log->done, // bool to int (0 or 1)
-            (int)log->in_jail, // bool to int
+            (int)log->done,
+            (int)log->in_jail,
             log->fee_paid,
             log->agent_action,
             log->num_owned_properties,
-            escaped_card_name ? escaped_card_name : "\"\"", // Use "" if escaping failed completely
+            escaped_card_name ? escaped_card_name : "\"\"",
             escaped_card_spec_desc ? escaped_card_spec_desc : "\"\"",
             escaped_action_desc ? escaped_action_desc : "\"\""
-           );
+    );
+
+    if (write_result < 0) {
+        fprintf(stderr, "Error writing to CSV file: %s\n", strerror(errno));
+    }
+
+    // Force flush after each write
+    fflush(fp);
 
     // Free the allocated escaped strings
     free(escaped_action_desc);
     free(escaped_card_name);
     free(escaped_card_spec_desc);
+}
+
+// Function to update Q-table from parallel episodes
+void update_q_table_from_cuda_episodes(MonteCarloAgent* agent, CUDAEpisodeData* episodes, int num_episodes) {
+    for (int ep = 0; ep < num_episodes; ep++) {
+        CUDAEpisodeData* episode = &episodes[ep];
+        
+        // Create a temporary episode history
+        EpisodeHistory history;
+        init_episode_history(&history, episode->count);
+        
+        // Copy steps from CUDA episode data
+        for (int i = 0; i < episode->count; i++) {
+            add_episode_step(&history, episode->steps[i].state, episode->steps[i].action, episode->steps[i].reward);
+        }
+        
+        // Update Q-table using the episode
+        update_mc(agent, &history);
+        
+        // Free the temporary history
+        free_episode_history(&history);
+    }
 }
 
 // --- Main Function ---
@@ -1456,7 +1812,7 @@ int main(int argc, char *argv[]) {
     int num_players = 2;
     int start_money = 1500;
     int go_reward = 200;
-    int num_episodes = 20000; // Default number of episodes
+    int num_episodes = 500; // Default number of episodes
     double epsilon = 0.1;
     const char* csv_filename = "monopoly_training_log.csv";
 
@@ -1464,8 +1820,8 @@ int main(int argc, char *argv[]) {
     if (argc > 1) {
         num_episodes = atoi(argv[1]);
         if (num_episodes <= 0) {
-            fprintf(stderr, "Warning: Invalid number of episodes specified. Using default %d.\n", 20000);
-            num_episodes = 20000;
+            fprintf(stderr, "Warning: Invalid number of episodes specified. Using default %d.\n", 500);
+            num_episodes = 500;
         }
     }
     if (argc > 2) {
@@ -1497,48 +1853,189 @@ int main(int argc, char *argv[]) {
 
     // --- Write CSV Header ---
     fprintf(csv_file, "episode_id,step,player,position_before,dice_roll,landed_on_position,position_after,money_before,money_after,reward,done,in_jail,fee_paid,agent_action,num_owned_properties,card_drawn,card_specific_desc,action_desc\n");
+    fflush(csv_file); // Ensure header is written immediately
 
+    printf("Starting Parallel Monte Carlo Training for %d episodes...\n", num_episodes);
 
-    printf("Starting Monte Carlo Training for %d episodes...\n", num_episodes);
-
+    // --- CUDA Setup ---
+    cudaError_t cuda_status;
+    
+    // Determine number of threads and blocks
+    int threads_per_block = THREADS_PER_BLOCK;
+    int num_blocks = (num_episodes + threads_per_block - 1) / threads_per_block;
+    if (num_blocks > MAX_BLOCKS) num_blocks = MAX_BLOCKS;
+    
+    int episodes_per_batch = threads_per_block * num_blocks;
+    int num_batches = (num_episodes + episodes_per_batch - 1) / episodes_per_batch;
+    
+    printf("CUDA Configuration: %d blocks, %d threads per block\n", num_blocks, threads_per_block);
+    printf("Processing in %d batches of up to %d episodes each\n", num_batches, episodes_per_batch);
+    
+    // Allocate device memory for random states
+    curandState* d_rand_states;
+    cuda_status = cudaMalloc((void**)&d_rand_states, threads_per_block * num_blocks * sizeof(curandState));
+    if (cuda_status != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: Failed to allocate device memory for random states: %s\n", 
+                cudaGetErrorString(cuda_status));
+        fclose(csv_file);
+        destroy_monopoly_env(env);
+        destroy_monte_carlo_agent(agent);
+        return 1;
+    }
+    
+    // Initialize random states
+    init_rand_states<<<num_blocks, threads_per_block>>>(d_rand_states, time(NULL));
+    
+    // Allocate device memory for property data
+    int* d_property_prices;
+    int* d_property_rents;
+    int* d_property_house_costs;
+    
+    cuda_status = cudaMalloc((void**)&d_property_prices, BOARD_SIZE * sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: Failed to allocate device memory for property prices: %s\n", 
+                cudaGetErrorString(cuda_status));
+        cudaFree(d_rand_states);
+        fclose(csv_file);
+        destroy_monopoly_env(env);
+        destroy_monte_carlo_agent(agent);
+        return 1;
+    }
+    
+    cuda_status = cudaMalloc((void**)&d_property_rents, BOARD_SIZE * sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: Failed to allocate device memory for property rents: %s\n", 
+                cudaGetErrorString(cuda_status));
+        cudaFree(d_property_prices);
+        cudaFree(d_rand_states);
+        fclose(csv_file);
+        destroy_monopoly_env(env);
+        destroy_monte_carlo_agent(agent);
+        return 1;
+    }
+    
+    cuda_status = cudaMalloc((void**)&d_property_house_costs, BOARD_SIZE * sizeof(int));
+    if (cuda_status != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: Failed to allocate device memory for property house costs: %s\n", 
+                cudaGetErrorString(cuda_status));
+        cudaFree(d_property_rents);
+        cudaFree(d_property_prices);
+        cudaFree(d_rand_states);
+        fclose(csv_file);
+        destroy_monopoly_env(env);
+        destroy_monte_carlo_agent(agent);
+        return 1;
+    }
+    
+    // Copy property data to device
+    int h_property_prices[BOARD_SIZE] = {0};
+    int h_property_rents[BOARD_SIZE] = {0};
+    int h_property_house_costs[BOARD_SIZE] = {0};
+    
+    for (int i = 0; i < BOARD_SIZE; i++) {
+        h_property_prices[i] = env->properties[i].price;
+        h_property_rents[i] = env->properties[i].rent;
+        h_property_house_costs[i] = env->properties[i].house_cost;
+    }
+    
+    cudaMemcpy(d_property_prices, h_property_prices, BOARD_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_property_rents, h_property_rents, BOARD_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_property_house_costs, h_property_house_costs, BOARD_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+    
+    // Allocate host and device memory for episode data
+    CUDAEpisodeData* h_episode_data = (CUDAEpisodeData*)malloc(episodes_per_batch * sizeof(CUDAEpisodeData));
+    CUDAEpisodeData* d_episode_data;
+    
+    cuda_status = cudaMalloc((void**)&d_episode_data, episodes_per_batch * sizeof(CUDAEpisodeData));
+    if (cuda_status != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: Failed to allocate device memory for episode data: %s\n", 
+                cudaGetErrorString(cuda_status));
+        cudaFree(d_property_house_costs);
+        cudaFree(d_property_rents);
+        cudaFree(d_property_prices);
+        cudaFree(d_rand_states);
+        free(h_episode_data);
+        fclose(csv_file);
+        destroy_monopoly_env(env);
+        destroy_monte_carlo_agent(agent);
+        return 1;
+    }
+    
     // --- Training Loop ---
-    for (int ep = 0; ep < num_episodes; ++ep) {
-        LogEntry* episode_logs = NULL; // Will point to the static buffer in generate_episode_mc
-        int log_count = 0;
-
-        // Generate an episode using the current policy and capture logs
-        EpisodeHistory history = generate_episode_mc(agent, env, ep, &episode_logs, &log_count);
-
-        if (history.count < 0) { // Check for error from generate_episode
-            fprintf(stderr, "Error during episode generation %d. Stopping.\n", ep);
+    for (int batch = 0; batch < num_batches; batch++) {
+        int batch_offset = batch * episodes_per_batch;
+        int batch_size = (batch == num_batches - 1 && num_episodes % episodes_per_batch != 0) 
+                        ? num_episodes % episodes_per_batch 
+                        : episodes_per_batch;
+        
+        // Calculate actual blocks needed for this batch
+        int batch_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+        
+        printf("Processing batch %d/%d: Episodes %d-%d\n", 
+               batch + 1, num_batches, batch_offset + 1, batch_offset + batch_size);
+        
+        // Launch kernel to simulate episodes in parallel
+        simulate_episodes_kernel<<<batch_blocks, threads_per_block>>>(
+            d_rand_states,
+            num_players,
+            start_money,
+            go_reward,
+            BOARD_SIZE,
+            env->jail_position,
+            env->go_to_jail_position,
+            env->jail_turns,
+            d_property_prices,
+            d_property_rents,
+            d_property_house_costs,
+            epsilon,
+            d_episode_data,
+            batch_offset
+        );
+        
+        // Check for kernel launch errors
+        cuda_status = cudaGetLastError();
+        if (cuda_status != cudaSuccess) {
+            fprintf(stderr, "CUDA Error: Failed to launch kernel: %s\n", cudaGetErrorString(cuda_status));
             break;
         }
-
-        // Write the logs for this episode to the CSV file
-        if (episode_logs != NULL) {
-            for (int i = 0; i < log_count; ++i) {
-                write_log_to_csv(csv_file, &episode_logs[i]);
+        
+        // Wait for kernel to complete
+        cudaDeviceSynchronize();
+        
+        // Copy episode data back to host
+        cudaMemcpy(h_episode_data, d_episode_data, batch_size * sizeof(CUDAEpisodeData), cudaMemcpyDeviceToHost);
+        
+        // Update Q-table from episode data
+        update_q_table_from_cuda_episodes(agent, h_episode_data, batch_size);
+        
+        // Write logs to CSV
+        for (int i = 0; i < batch_size; i++) {
+            CUDAEpisodeData* episode = &h_episode_data[i];
+            if (episode->log_count > 0) {
+                printf("Writing logs for episode %d (log count: %d)\n", episode->episode_id, episode->log_count);
+                for (int j = 0; j < episode->log_count; j++) {
+                    write_log_to_csv(csv_file, &episode->logs[j]);
+                }
             }
-        } else {
-             fprintf(stderr, "Warning: No logs returned for episode %d.\n", ep);
         }
-
-
-        // Update the agent's Q-values based on the episode history
-        update_mc(agent, &history);
-
-        // Free the memory used by the episode history struct itself
-        free_episode_history(&history);
-
-        // Print progress
-        if ((ep + 1) % 1000 == 0 || ep == num_episodes - 1) {
-            printf("Episode %d/%d completed. Q-Table size: %d\n", ep + 1, num_episodes, agent->q_table->count);
-            // Flush the CSV buffer occasionally to ensure data is written
-            fflush(csv_file);
+        
+        // Flush CSV file after each batch
+        if (fflush(csv_file) != 0) {
+            fprintf(stderr, "Warning: Error flushing CSV file: %s\n", strerror(errno));
         }
+        
+        printf("Batch %d completed. Q-Table size: %d\n", batch + 1, agent->q_table->count);
     }
 
     printf("Training finished.\n");
+
+    // --- Clean up CUDA resources ---
+    cudaFree(d_episode_data);
+    cudaFree(d_property_house_costs);
+    cudaFree(d_property_rents);
+    cudaFree(d_property_prices);
+    cudaFree(d_rand_states);
+    free(h_episode_data);
 
     // --- Close CSV File ---
     if (fclose(csv_file) != 0) {
@@ -1546,7 +2043,6 @@ int main(int argc, char *argv[]) {
     } else {
         printf("Log saved to '%s'.\n", csv_filename);
     }
-
 
     // --- Optional: Print some learned Q-values (example) ---
     printf("\nExample Q-values (State: Pos, MoneyBin, PropOwner, InJail):\n");
@@ -1571,7 +2067,6 @@ int main(int argc, char *argv[]) {
             printf(" No Q-values learned or printed (maybe insufficient training or no relevant states encountered early).\n");
         }
     }
-
 
     // --- Clean up ---
     printf("\nCleaning up...\n");
