@@ -1377,6 +1377,35 @@ void update_mc(MonteCarloAgent* agent, EpisodeHistory* history) {
     // Clean up the temporary visited set for this episode
     destroy_visited_set(visited_state_actions);
 }
+void export_q_table_to_csv(QHashTable* q_table, const char* filename) {
+    FILE* fp = fopen(filename, "w");
+    if (!fp) {
+        fprintf(stderr, "Error: Could not open Q-table CSV file '%s' for writing.\n", filename);
+        return;
+    }
+    // Write header
+    fprintf(fp, "position,money_bin,current_prop_owner,in_jail,action,q_value,count\n");
+    for (int i = 0; i < q_table->size; ++i) {
+        QTableEntry* entry = q_table->table[i];
+        while (entry != NULL) {
+            for (int action = 0; action < 2; ++action) {
+                if (entry->values[action].count > 0) {
+                    fprintf(fp, "%d,%d,%d,%d,%d,%.6f,%d\n",
+                        entry->key.position,
+                        entry->key.money_bin,
+                        entry->key.current_prop_owner,
+                        entry->key.in_jail,
+                        action,
+                        entry->values[action].q_value,
+                        entry->values[action].count
+                    );
+                }
+            }
+            entry = entry->next;
+        }
+    }
+    fclose(fp);
+}
 static char* escape_csv_string(const char* input) {
     if (!input) return NULL;
 
@@ -1452,15 +1481,6 @@ static void write_log_to_csv(FILE* fp, const LogEntry* log) {
 
 // --- Main Function ---
 int main(int argc, char *argv[]) {
-
-    // --- Timing Variables ---
-    clock_t total_start_time, total_end_time;
-    clock_t loop_start_time, loop_end_time;
-    double total_cpu_time_used;
-    double loop_cpu_time_used;
-
-    total_start_time = clock(); // Start overall timer
-
     // --- Parameters ---
     int num_players = 2;
     int start_money = 1500;
@@ -1509,20 +1529,19 @@ int main(int argc, char *argv[]) {
     fprintf(csv_file, "episode_id,step,player,position_before,dice_roll,landed_on_position,position_after,money_before,money_after,reward,done,in_jail,fee_paid,agent_action,num_owned_properties,card_drawn,card_specific_desc,action_desc\n");
     fflush(csv_file); // Ensure header is written
 
-
     printf("Starting Sequential Monte Carlo Training for %d episodes...\n", num_episodes);
 
-    // --- Training Loop ---
-    loop_start_time = clock(); // Start timing the main loop
+    // --- Training Loop with Timing ---
+    clock_t start_time = clock();
 
     for (int ep = 0; ep < num_episodes; ++ep) {
-        LogEntry* episode_logs = NULL; // Will point to the static buffer in generate_episode_mc
+        LogEntry* episode_logs = NULL;
         int log_count = 0;
 
         // Generate an episode using the current policy and capture logs
         EpisodeHistory history = generate_episode_mc(agent, env, ep, &episode_logs, &log_count);
 
-        if (history.count < 0) { // Check for error from generate_episode
+        if (history.count < 0) {
             fprintf(stderr, "Error during episode generation %d. Stopping.\n", ep);
             break;
         }
@@ -1532,11 +1551,7 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < log_count; ++i) {
                 write_log_to_csv(csv_file, &episode_logs[i]);
             }
-        } else {
-             // Should not happen if generate_episode_mc succeeded, but check anyway
-             // fprintf(stderr, "Warning: No logs returned for episode %d despite success?\n", ep);
         }
-
 
         // Update the agent's Q-values based on the episode history
         update_mc(agent, &history);
@@ -1544,76 +1559,60 @@ int main(int argc, char *argv[]) {
         // Free the memory used by the episode history struct itself
         free_episode_history(&history);
 
-        // Print progress (less frequently to avoid slowing down measurements)
+        // Print progress (less frequently)
         if ((ep + 1) % 5000 == 0 || ep == num_episodes - 1) {
             printf("Episode %d/%d completed. Q-Table size: %d\n", ep + 1, num_episodes, agent->q_table ? agent->q_table->count : 0);
-            fflush(csv_file); // Flush CSV occasionally
+            fflush(csv_file);
         }
     }
 
-    loop_end_time = clock(); // Stop timing the main loop
-    printf("Training finished.\n");
+    clock_t end_time = clock();
+    double cpu_time_used = ((double) (end_time - start_time)) / CLOCKS_PER_SEC;
+
+    printf("\n--- Performance Metrics ---\n");
+    printf("CPU Training Time: %.2f milliseconds\n", cpu_time_used * 1000.0);
+    printf("Training throughput: %.2f episodes/second\n", num_episodes / cpu_time_used);
+    printf("------------------------\n");
 
     // --- Close CSV File ---
     if (fclose(csv_file) != 0) {
-         fprintf(stderr, "Warning: Error closing CSV file '%s': %s\n", csv_filename, strerror(errno));
+        fprintf(stderr, "Warning: Error closing CSV file '%s': %s\n", csv_filename, strerror(errno));
     } else {
         printf("Log saved to '%s'.\n", csv_filename);
     }
 
-    // --- Optional: Print some learned Q-values (example) ---
+    // --- Optional: Print some learned Q-values ---
     printf("\nExample Q-values (State: Pos, MoneyBin, PropOwner, InJail):\n");
     int print_count = 0;
     if (agent && agent->q_table && agent->q_table->table) {
         for (int i = 0; i < agent->q_table->size && print_count < 20; ++i) {
             QTableEntry* entry = agent->q_table->table[i];
             while (entry != NULL && print_count < 20) {
-                 StateTuple s = entry->key;
-                 // Print only if visited
-                 if (entry->values[0].count > 0 || entry->values[1].count > 0) {
-                     printf(" State (%2d, %3d, %2d, %d): Q(Pass)=%8.2f (%5d visits), Q(Buy)=%8.2f (%5d visits)\n",
-                            s.position, s.money_bin, s.current_prop_owner, s.in_jail,
-                            entry->values[0].q_value, entry->values[0].count,
-                            entry->values[1].q_value, entry->values[1].count);
-                     print_count++;
-                 }
-                 entry = entry->next;
+                StateTuple s = entry->key;
+                if (entry->values[0].count > 0 || entry->values[1].count > 0) {
+                    printf(" State (%2d, %3d, %2d, %d): Q(Pass)=%8.2f (%5d visits), Q(Buy)=%8.2f (%5d visits)\n",
+                           s.position, s.money_bin, s.current_prop_owner, s.in_jail,
+                           entry->values[0].q_value, entry->values[0].count,
+                           entry->values[1].q_value, entry->values[1].count);
+                    print_count++;
+                }
+                entry = entry->next;
             }
         }
         if (print_count == 0) {
-            printf(" No Q-values learned or printed (maybe insufficient training or no relevant states encountered early).\n");
+            printf(" No Q-values learned or printed.\n");
         } else {
-             printf(" Printed top %d Q-value entries found.\n", print_count);
+            printf(" Printed top %d Q-value entries found.\n", print_count);
         }
     } else {
         printf(" Q-Table not available for printing.\n");
     }
 
-
     // --- Clean up ---
     printf("\nCleaning up...\n");
     destroy_monte_carlo_agent(agent);
     destroy_monopoly_env(env);
-
-    total_end_time = clock(); // Stop overall timer
-
-    // --- Performance Metrics ---
-    loop_cpu_time_used = ((double) (loop_end_time - loop_start_time)) / CLOCKS_PER_SEC;
-    total_cpu_time_used = ((double) (total_end_time - total_start_time)) / CLOCKS_PER_SEC;
-
-    printf("\n--- Performance (Sequential) ---:\n");
-    printf("CPU Time (Main Loop - Episode Gen, Q-Update, Logging): %.3f seconds\n", loop_cpu_time_used);
-    printf("Total CPU Time (Incl. Init, Loop, Cleanup): %.3f seconds\n", total_cpu_time_used);
-     if (loop_cpu_time_used > 0) {
-        printf("Throughput (Main Loop): %.2f episodes/sec\n", (float)num_episodes / loop_cpu_time_used);
-    } else {
-        printf("Throughput (Main Loop): N/A (Loop time was zero)\n");
-    }
-    printf("----------------------------------\n");
-
-
     printf("Done.\n");
-
 
     return 0;
 }
