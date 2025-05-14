@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project explores how **Reinforcement Learning (RL)** combined with **Monte Carlo Simulation** can be applied to the classic board game **Monopoly**. Developed under the supervision of **Dr. Rachad Atat** as part of my Spring 2025 academic term, this project demonstrates how parallel computing techniques can accelerate training and learning in complex, stochastic environments.
+This project explores how **Reinforcement Learning (RL)** combined with **Monte Carlo Simulation** can be applied to the classic board game **Monopoly**. Developed as part of my Spring 2025 academic term, this project demonstrates how parallel computing techniques can accelerate training and learning in complex, stochastic environments.
 
 ---
 
