@@ -1,62 +1,56 @@
-🧠🎲 Reinforcement Learning + Monte Carlo Simulation on Monopoly
-Project Overview
-This project explores how Reinforcement Learning (RL) combined with Monte Carlo Simulation can be applied to the classic board game Monopoly. The goal is to enable an AI agent to learn optimal strategies through trial and error — without explicitly programming every possible move.
+# 🧠🎲 Reinforcement Learning + Monte Carlo Simulation on Monopoly
 
-Developed under the supervision of Dr. Rachad Atat as part of my Spring 2025 academic term, this project showcases how parallel computing can accelerate training and learning processes in complex, stochastic environments like Monopoly.
+## Overview
 
-💡 Why Monopoly?
-Monopoly is:
+This project explores how **Reinforcement Learning (RL)** combined with **Monte Carlo Simulation** can be applied to the classic board game **Monopoly**. Developed under the supervision of **Dr. Rachad Atat** as part of my Spring 2025 academic term, this project demonstrates how parallel computing techniques can accelerate training and learning in complex, stochastic environments.
 
-Complex enough to require strategic decision-making
+---
 
-Rich in probabilistic outcomes (dice rolls, Chance and Community Chest cards)
+## 🎯 Objective
 
-Fun and relatable, making it an engaging platform for AI experimentation
+To build an AI agent that learns optimal strategies in Monopoly through trial and error, without explicitly programming every move. The agent plays thousands of simulated games and learns from the outcomes to make better decisions over time.
 
-🧠 How It Works
-In this implementation:
+---
 
-The agent interacts with the game environment, making decisions at each step (e.g., buy/sell property, build houses).
+## 🧠 How It Works
 
-Rewards are given based on outcomes (e.g., gaining money, acquiring properties, avoiding bankruptcy).
+- The AI agent interacts with a simplified Monopoly environment.
+- It receives **rewards** for favorable outcomes like acquiring property, earning money, or winning.
+- Using **Monte Carlo methods**, the agent estimates long-term value of actions by averaging rewards over many episodes.
+- This allows the agent to develop a **policy** that maximizes its chances of winning.
+- No complete mathematical model of the game is required — the agent learns directly from experience.
 
-Using Monte Carlo methods, the agent simulates thousands of games to estimate the value of its actions over time.
+---
 
-This allows the agent to learn a policy that improves its chance of winning — all without a full mathematical model of the entire game.
+## 🎮 Features
 
-⚙️ Implementation Details
-🐍 Python
-Initial implementation of the game logic and reinforcement learning algorithm.
+The game implementation includes:
 
-Used to prototype and validate the agent's learning behavior.
+- Simplified Monopoly board and game rules
+- Buying/selling properties
+- Building houses
+- Chance and Community Chest cards
+- Jail handling
+- Bankruptcy mechanics
 
-💻 C + CUDA C
-Translated the Python code to C for performance.
+---
 
-Parallelized simulations using CUDA C, enabling hundreds or thousands of games to run simultaneously on the GPU.
+## ⚙️ Implementation Details
 
-This massively reduces training time and allows better exploration of the game state space.
+### 🐍 Python
+- Used for the initial implementation of the game logic and RL agent.
+- Helped prototype and test the learning approach.
 
-🎮 Game Features
-Implemented features in the simplified Monopoly version include:
+### 💻 C and CUDA C
+- Translated the Python codebase to C for performance optimization.
+- Implemented **CUDA C** to parallelize simulations, allowing:
+  - Hundreds or thousands of games to run in parallel
+  - Drastic reduction in training time
+  - Efficient exploration of state space
 
-Game board with key actions (property purchase, rent collection, etc.)
+---
 
-Chance and Community Chest cards
+## 📢 Why Monopoly?
 
-Jail handling mechanics
+Because it's **fun** and **challenging** — a perfect playground for building smart, adaptive AI!
 
-Bankruptcy rules
-
-Buying and selling properties
-
-House construction
-
-🚀 Future Improvements
-Add trading between players
-
-Incorporate more advanced RL algorithms (e.g., Deep Q-Learning)
-
-Visualize agent behavior and policy evolution
-
-Extend to full Monopoly ruleset
