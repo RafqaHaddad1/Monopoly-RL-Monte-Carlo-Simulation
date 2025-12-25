@@ -4,13 +4,12 @@
 
 This project explores how **Reinforcement Learning (RL)** combined with **Monte Carlo Simulation** can be applied to the classic board game **Monopoly**. Developed as part of my Spring 2025 academic term, this project demonstrates how parallel computing techniques can accelerate training and learning in complex, stochastic environments.
 
----
 
 ## 🎯 Objective
 
 To build an AI agent that learns optimal strategies in Monopoly through trial and error, without explicitly programming every move. The agent plays thousands of simulated games and learns from the outcomes to make better decisions over time.
 
----
+
 
 ## 🧠 How It Works
 
@@ -20,7 +19,7 @@ To build an AI agent that learns optimal strategies in Monopoly through trial an
 - This allows the agent to develop a **policy** that maximizes its chances of winning.
 - No complete mathematical model of the game is required — the agent learns directly from experience.
 
----
+
 
 ## 🎮 Features
 
@@ -33,7 +32,7 @@ The game implementation includes:
 - Jail handling
 - Bankruptcy mechanics
 
----
+
 
 ## ⚙️ Implementation Details
 
@@ -48,7 +47,7 @@ The game implementation includes:
   - Drastic reduction in training time
   - Efficient exploration of state space
 
----
+
 
 ## 📢 Why Monopoly?
 
